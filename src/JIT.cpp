@@ -5,17 +5,26 @@
  * 使用 arch:: 分配可执行内存，手写 x86-64 字节码。
  *
  * 寄存器映射 (固定):
- *   v0(RAX) v1(RDI) v2(RSI) v3(RDX) v4(RCX)
- *   v5(R8)  v6(R9)  v7(R10) v8(R11)
- *   v9(RBX) v10(R12) v11(R13) v12(R14) v13(R15)
+ *   v0(RAX) v1(RBX) v2(R12) v3(R13) v4(R14) v5(R15)  (callee-saved)
+ *   v6(RSI) v7(RDI) v8(RDX) v9(RCX) v10(R8) v11(R9)  (caller-saved)
+ *   v12(R10) v13(R11)
  *   v14+ → 栈溢出
  */
 
 #include "JIT.h"
 #include <iostream>
+#include <vector>
 #include "JITPlatform.h"
 
 #ifdef OPTIMIZATION
+
+#include <iostream>
+
+// JIT 辅助函数：PRINT 调用此函数输出整数
+extern "C" void jit_print_int(int64_t val)
+{
+    std::cout << val << '\n';
+}
 
 // JIT 函数指针全局表（供 JIT 编译的代码调用其他 JIT 函数时使用）
 static int64_t g_jitTable[256];
@@ -88,9 +97,7 @@ void JITCompiler::emitREX(bool w, bool r, bool x, bool b)
 }
 
 void JITCompiler::emitModRM(uint8_t mod, uint8_t oreg, uint8_t ereg)
-{
-    emit8((mod << 6) | ((oreg & 7) << 3) | (ereg & 7));
-}
+{ emit8((mod << 6) | ((oreg & 7) << 3) | (ereg & 7)); }
 
 void JITCompiler::emitModRMSIB(uint8_t mod, uint8_t oreg, uint8_t base,
                                uint8_t index, uint8_t scale)
@@ -346,24 +353,39 @@ void JITCompiler::emitJumpToLabel(const char* cc, size_t label)
         forwardJumps.push_back({ codePos - 4, label });
     } else {
         // 后向跳转：直接写偏移
-        int32_t offset = labels[label].target - (int32_t)(codePos + 4);
-        if (cc)
-            emitJCCrel(cc, offset);
-        else
+        if (cc) {
+            int32_t offShort = labels[label].target - (int32_t)(codePos + 2);
+            int32_t offLong = labels[label].target - (int32_t)(codePos + 6);
+            if (offShort >= -128 && offShort <= 127) {
+                static const char* cclist[] = {
+                    "jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja",
+                    "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg",
+                };
+                int op = -1;
+                for (int i = 0; i < 16; i++)
+                    if (strcmp(cc, cclist[i]) == 0) { op = i; break; }
+                if (op >= 0) {
+                    emit8(0x70 | op);
+                    emit8((int8_t)offShort);
+                }
+            } else {
+                emitJCCrel(cc, offLong);
+            }
+        } else {
+            int32_t offset = labels[label].target - (int32_t)(codePos + 5);
             emitJMPrel(offset);
+        }
     }
 }
 
 void JITCompiler::emitJumpToLabel(size_t label)
-{
-    emitJumpToLabel(nullptr, label);
-}
+{ emitJumpToLabel(nullptr, label); }
 
 // ==================== 函数编译 ====================
 
 bool JITCompiler::canJIT(const FunctionInfo& func, const BytecodeProgram& prog)
 {
-    // 跳过含 PRINT 的函数（当前 JIT 不支持输出）
+    // 跳过含 MOVS 的函数（当前 JIT 不支持字符串加载）
     int end = prog.getCodeSize();
     for (size_t i = 0; i < prog.functions.size(); i++) {
         if (prog.functions[i].codeOffset == func.codeOffset) {
@@ -375,7 +397,8 @@ bool JITCompiler::canJIT(const FunctionInfo& func, const BytecodeProgram& prog)
 
     for (int pc = func.codeOffset; pc < end; pc += 8) {
         Opcode op = (Opcode)prog.code[pc];
-        if (op == Opcode::MOVS || op == Opcode::PRINT) return false;
+        if (op == Opcode::MOVS) return false;
+        if (op == Opcode::DIV || op == Opcode::MOD) return false;
     }
     return true;
 }
@@ -402,6 +425,16 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
         if (prog.functions[i].codeOffset > func.codeOffset
             && prog.functions[i].codeOffset < endOff)
             endOff = prog.functions[i].codeOffset;
+    }
+    // 对于最后一个函数，排除入口点代码（CALL + HALT）
+    // 入口点在所有函数之后，以 HALT 结尾
+    if (funcIdx == static_cast<int>(prog.functions.size()) - 1) {
+        for (int pc = prog.getCodeSize() - 8; pc >= func.codeOffset; pc -= 8) {
+            if ((Opcode)prog.code[pc] == Opcode::HALT) {
+                endOff = pc;
+                break;
+            }
+        }
     }
 
     // ----- 寄存器着色 -----
@@ -443,7 +476,7 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
          needR13 = (func.paramCount >= 3);
     bool needR14 = false, needR15 = false;
     for (int pc = func.codeOffset; pc < endOff; pc += 8) {
-        uint8_t rd = code[pc + 1], rs1 = code[pc + 2];
+        uint8_t rd = code[pc + 1], rs1 = code[pc + 2], rs2 = code[pc + 3];
         int p = vregToPhys(rd);
         if (p == RBX) needRBX = true;
         if (p == R12) needR12 = true;
@@ -455,6 +488,11 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
         if (vregToPhys(rs1) == R13) needR13 = true;
         if (vregToPhys(rs1) == R14) needR14 = true;
         if (vregToPhys(rs1) == R15) needR15 = true;
+        if (vregToPhys(rs2) == RBX) needRBX = true;
+        if (vregToPhys(rs2) == R12) needR12 = true;
+        if (vregToPhys(rs2) == R13) needR13 = true;
+        if (vregToPhys(rs2) == R14) needR14 = true;
+        if (vregToPhys(rs2) == R15) needR15 = true;
     }
 
     // 栈溢出槽位（v14+ 的寄存器需要 spill 到栈）
@@ -498,8 +536,11 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
     if (needR14) pushedBytes += 8;
     if (needR15) pushedBytes += 8;
     int alignedFrame = (stackFrame + 15) & ~15;
-    // 保持栈对齐：(pushedBytes + alignedFrame) % 16 == 0
-    while ((pushedBytes + alignedFrame) % 16 != 0) alignedFrame += 8;
+    // SysV ABI: 入口 RSP ≡ 8(mod 16)（CALL 压入返回地址）
+    // 函数体内需 RSP ≡ 0 (mod 16) 以便后续 CALL 对齐
+    // RSP_after = entry_RSP - (pushedBytes + alignedFrame)
+    // 需要 (pushedBytes + alignedFrame) ≡ 8 (mod 16)
+    while ((pushedBytes + alignedFrame) % 16 != 8) alignedFrame += 8;
     // spill 槽位紧接在 callee-saved 保存之后
     spillBase = -pushedBytes;
 
@@ -512,17 +553,19 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
 
     // 将参数从 SysV 调用约定寄存器复制到对应的 callee-saved 物理寄存器
     // （必须在 callee-saved push 之后，确保原始值已保存）
-    if (func.paramCount >= 1) emitMOV(RBX, RDI);
-    if (func.paramCount >= 2) emitMOV(R12, RSI);
-    if (func.paramCount >= 3) emitMOV(R13, RDX);
+    if (func.paramCount >= 1) emitMOV(RBX, RDI);   // v1 ← RDI
+    if (func.paramCount >= 2) emitMOV(R12, RSI);   // v2 ← RSI
+    if (func.paramCount >= 3) emitMOV(R13, RDX);   // v3 ← RDX
+    if (func.paramCount >= 4) emitMOV(R14, RCX);   // v4 ← RCX
+    if (func.paramCount >= 5) emitMOV(R15, R8);    // v5 ← R8
+    if (func.paramCount >= 6) emitMOV(RSI, R9);    // v6 ← R9
 
     // ===== 翻译字节码 =====
     vector<int> pushStack; // 记录 PUSH 的虚拟寄存器，供 CALL 使用
 
     for (int pc = func.codeOffset; pc < endOff; pc += 8) {
-        // 如果此 PC 是跳转目标，记录 JIT 位置
-        auto lit = pcLabels.find(pc);
-        if (lit != pcLabels.end()) lit->second = (int32_t)codePos;
+        // 无条件记录每个字节码 PC 的 JIT 偏移，确保后向跳转总能找到目标
+        pcLabels[pc] = (int32_t)codePos;
 
         Opcode op = (Opcode)code[pc];
         uint8_t rd = code[pc + 1];
@@ -736,6 +779,64 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
             break;
         }
 
+        case Opcode::DIV: {
+            int pdst = vregToPhys(rd);
+            int psrc1 = vregToPhys(rs1);
+            int psrc2 = vregToPhys(rs2);
+            if (psrc1 >= 0) {
+                if (psrc1 != RAX) emitMOV(RAX, psrc1);
+            } else {
+                emitMOVfromStack(RAX, spillBase - (rs1 - 14) * 8);
+            }
+            emitREX(1, 0, 0, 0);
+            emit8(0x99);
+            if (psrc2 >= 0) {
+                emitREX(1, 0, 0, psrc2 >= 8);
+                emit8(0xF7);
+                emitModRM(3, 7, psrc2 & 7);
+            } else {
+                int t2 = R10;
+                emitMOVfromStack(t2, spillBase - (rs2 - 14) * 8);
+                emitREX(1, 0, 0, 0);
+                emit8(0xF7);
+                emitModRM(3, 7, t2 & 7);
+            }
+            if (pdst >= 0 && pdst != RAX)
+                emitMOV(pdst, RAX);
+            else if (pdst < 0)
+                emitMOVtoStack(spillBase - (rd - 14) * 8, RAX);
+            break;
+        }
+
+        case Opcode::MOD: {
+            int pdst = vregToPhys(rd);
+            int psrc1 = vregToPhys(rs1);
+            int psrc2 = vregToPhys(rs2);
+            if (psrc1 >= 0) {
+                if (psrc1 != RAX) emitMOV(RAX, psrc1);
+            } else {
+                emitMOVfromStack(RAX, spillBase - (rs1 - 14) * 8);
+            }
+            emitREX(1, 0, 0, 0);
+            emit8(0x99);
+            if (psrc2 >= 0) {
+                emitREX(1, 0, 0, psrc2 >= 8);
+                emit8(0xF7);
+                emitModRM(3, 7, psrc2 & 7);
+            } else {
+                int t2 = R10;
+                emitMOVfromStack(t2, spillBase - (rs2 - 14) * 8);
+                emitREX(1, 0, 0, 0);
+                emit8(0xF7);
+                emitModRM(3, 7, t2 & 7);
+            }
+            if (pdst >= 0 && pdst != RDX)
+                emitMOV(pdst, RDX);
+            else if (pdst < 0)
+                emitMOVtoStack(spillBase - (rd - 14) * 8, RDX);
+            break;
+        }
+
         case Opcode::EQ: {
             int pdst = vregToPhys(rd);
             int psrc1 = vregToPhys(rs1);
@@ -898,7 +999,8 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
             auto it = pcLabels.find(targetPc);
             if (it != pcLabels.end()) {
                 // 后向跳转：label 已绑定
-                int32_t off = (int32_t)it->second - (int32_t)(codePos + 4);
+                // JMP rel32 指令长5字节，偏移量从指令末尾算起
+                int32_t off = (int32_t)it->second - (int32_t)(codePos + 5);
                 emitJMPrel(off);
             } else {
                 // 前向跳转：创建新 label，稍后回填
@@ -950,6 +1052,41 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
             break;
         }
 
+        case Opcode::PRINT: {
+            // 将源寄存器的值加载到 RDI（SysV 第一个参数）
+            int psrc = vregToPhys(rs1);
+            if (psrc >= 0 && psrc != RDI)
+                emitMOV(RDI, psrc);
+            else if (psrc < 0)
+                emitMOVfromStack(RDI, spillBase - (rs1 - 14) * 8);
+
+            // 保存 caller-saved 寄存器（jit_print_int 会破坏它们）
+            emitPUSH(R11);
+            emitPUSH(R10);
+            emitPUSH(R9);
+            emitPUSH(R8);
+            emitPUSH(RCX);
+            emitPUSH(RDX);
+            emitPUSH(RDI);
+            emitPUSH(RSI);
+
+            // 间接调用 jit_print_int（避免 rel32 溢出）
+            emitMOVi64(R10, (int64_t)jit_print_int);
+            emitCALLreg(R10);
+
+            // 恢复 caller-saved 寄存器
+            emitPOP(RSI);
+            emitPOP(RDI);
+            emitPOP(RDX);
+            emitPOP(RCX);
+            emitPOP(R8);
+            emitPOP(R9);
+            emitPOP(R10);
+            emitPOP(R11);
+
+            break;
+        }
+
         case Opcode::CALL: {
             int funcIdx2 = extra;
             int pCnt = prog.functions[funcIdx2].paramCount;
@@ -986,10 +1123,27 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
             for (int i = 0; i < pCnt && i < 6; i++) {
                 int vreg = pushStack[realStart + i];
                 int preg = vregToPhys(vreg);
-                if (preg >= 0)
-                    emitMOV(argRegs[i], preg);
-                else
+                if (preg >= 0) {
+                    if (preg == argRegs[i]) {
+                        // 源和目标相同，不需要拷贝
+                    } else {
+                        bool conflict = false;
+                        for (int j = i + 1; j < pCnt && j < 6; j++) {
+                            if (preg == argRegs[j]) {
+                                conflict = true;
+                                break;
+                            }
+                        }
+                        if (conflict) {
+                            emitMOV(R10, preg);
+                            emitMOV(argRegs[i], R10);
+                        } else {
+                            emitMOV(argRegs[i], preg);
+                        }
+                    }
+                } else {
                     emitMOVfromStack(argRegs[i], spillBase - (vreg - 14) * 8);
+                }
 #ifdef _DEBUG
                 const char* names[] = { "RAX", "RCX", "RDX", "RBX",
                                         "RSP", "RBP", "RSI", "RDI",
@@ -1126,9 +1280,7 @@ JITFunc JITCompiler::compileFunction(int funcIdx, const FunctionInfo& func,
         memcpy(codeBuf + pos + 1, &offset, 4);
     }
 
-    for (size_t b = 0; b < codePos - funcStart && b < 200; b++)
-
-        return (JITFunc)(codeBuf + funcStart);
+    return (JITFunc)(codeBuf + funcStart);
 }
 
 void JITCompiler::compile(BytecodeProgram& prog)
