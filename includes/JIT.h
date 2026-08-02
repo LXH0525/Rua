@@ -4,7 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "字节码.h"
+#include "Bytecode.h"
 
 //
 // JIT 编译器 — 将 Rua 字节码编译为 x86-64 机器码
@@ -116,6 +116,9 @@ class JITCompiler {
 
     // mov preg(dst), [rbp + offset] — 从栈加载
     void emitMOVfromStack(uint8_t dst, int32_t offset);
+
+    // mov preg(dst), [rsp + disp8] — 从 rsp 相对栈加载（SIB 寻址）
+    void emitMOVfromRSP(uint8_t dst, int8_t offset);
 
     // mov [rbp + offset], preg(src) — 存入栈
     void emitMOVtoStack(int32_t offset, uint8_t src);

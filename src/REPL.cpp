@@ -1,25 +1,25 @@
 ﻿#include "REPL.h"
-#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include "UTF32支持.h"
-#include "全局内容.h"
-#include "字节码.h"
-#include "虚拟机.h"
-#include "词法分析器.h"
-#include "语义分析.h"
-#include "语法分析器.h"
-#include "输出彩色支持.h"
+#include "FileSystem.h"
+#include "UTF32Support.h"
+#include "Globals.h"
+#include "Bytecode.h"
+#include "VM.h"
+#include "Lexer.h"
+#include "SemanticAnalysis.h"
+#include "Parser.h"
+#include "ColorOutput.h"
 #ifdef OPTIMIZATION
-#include "IR/控制流图.h"
+#include "IR/CFG.h"
 #include "JIT.h"
-#include "Optimizer/优化管理器.h"
-#include "中间生成.h"
+#include "Optimizer/PassManager.h"
+#include "TACGenerator.h"
 #endif
 
 #ifdef _DEBUG
-#include "调试输出支持.h"
+#include "DebugOutput.h"
 #endif
 
 using std::string;
@@ -114,14 +114,11 @@ void 编译并运行(const string& 源码)
 
 void 运行文件(const string& 路径)
 {
-    std::ifstream 文件(路径);
-    if (!文件.is_open()) {
+    string 源码;
+    if (!arch::readFile(路径, 源码)) {
         输出文本("错误：无法打开文件 '" + 路径 + "'", "RR");
         return;
     }
-    std::stringstream 缓冲区;
-    缓冲区 << 文件.rdbuf();
-    string 源码 = 缓冲区.str();
 
     输出文本("正在编译 " + 路径 + " ...", "青");
     编译并运行(源码);
