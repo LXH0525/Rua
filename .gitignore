@@ -361,3 +361,12 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+build
+.cache
+
+*.o
+Rua.exe
+Rua
+rua
+rua.exe
